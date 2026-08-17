@@ -499,12 +499,17 @@ impl KafkaClient {
     fn is_connection_error(error: &crate::Error) -> bool {
         match error {
             crate::Error::Kafka(KafkaError::Protocol(msg)) => {
-                msg.contains("Broken pipe")
-                    || msg.contains("early eof")
-                    || msg.contains("Connection reset")
-                    || msg.contains("Not connected")
-                    || msg.contains("connection abort")
-                    || msg.contains("timed out after")
+                let msg_lower = msg.to_lowercase();
+                msg_lower.contains("broken pipe")
+                    || msg_lower.contains("early eof")
+                    || msg_lower.contains("connection reset")
+                    || msg_lower.contains("not connected")
+                    || msg_lower.contains("connection abort")
+                    || msg_lower.contains("aborted")          // catches "was aborted by the software"
+                    || msg_lower.contains("timed out after")
+                    || msg_lower.contains("os error 10053")   // WSAECONNABORTED (Windows)
+                    || msg_lower.contains("os error 10054")   // WSAECONNRESET (Windows)
+                    || msg_lower.contains("os error 10060")   // WSAETIMEDOUT (Windows)
             }
             _ => false,
         }
