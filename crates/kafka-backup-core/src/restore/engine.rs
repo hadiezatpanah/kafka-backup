@@ -18,6 +18,7 @@ use crate::manifest::{
 use crate::metrics::PerformanceMetrics;
 use crate::storage::{create_backend, StorageBackend};
 use crate::{Error, Result};
+use crate::restore::offset_reset::{OffsetResetExecutor, OffsetResetReport, OffsetResetStrategy};
 
 /// Progress update sent during restore
 #[derive(Debug, Clone)]
@@ -742,6 +743,34 @@ impl RestoreEngine {
 
         let offset_mapping = self.offset_mapping.lock().await.clone();
 
+        // Automatically reset consumer group offsets on the target cluster once
+        // the in-memory offset mapping is complete. This uses the already-connected
+        // target router and the accurate detailed per-record mapping built during
+        // this restore run, rather than requiring a separate `offset-reset execute`
+        // CLI invocation with a possibly-stale/manifest-only mapping.
+        if restore_options.reset_consumer_offsets && !restore_options.consumer_groups.is_empty() {
+            match self
+                .execute_consumer_group_offset_reset(&offset_mapping, &restore_options)
+                .await
+            {
+                Ok(reset_report) => {
+                    info!(
+                        "Consumer group offset reset: {} partitions reset across {} groups",
+                        reset_report.partitions_reset,
+                        reset_report.groups_reset.len()
+                    );
+                    if !reset_report.success {
+                        for err in &reset_report.errors {
+                            warn!("Offset reset error: {}", err);
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Consumer group offset reset failed (non-fatal): {}", e);
+                }
+            }
+        }
+
         let report = RestoreReport {
             backup_id: self.config.backup_id.clone(),
             dry_run: false,
@@ -1252,6 +1281,39 @@ impl RestoreEngine {
         }
 
         Ok(())
+    }
+
+    async fn execute_consumer_group_offset_reset(
+        &self,
+        offset_mapping: &crate::manifest::OffsetMapping,
+        restore_options: &RestoreOptions,
+    ) -> crate::Result<OffsetResetReport> {
+        let router = self
+            .router
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| Error::Config("Router not initialized".to_string()))?;
+
+        let target = self.config.target.as_ref().unwrap();
+        let executor =
+            OffsetResetExecutor::new_with_router(router, target.bootstrap_servers.clone());
+
+        let plan = executor
+            .generate_plan(
+                offset_mapping,
+                &restore_options.consumer_groups,
+                OffsetResetStrategy::Auto,
+            )
+            .await?;
+
+        info!(
+        "Generated automatic offset reset plan for {} groups with {} total partitions",
+        plan.groups.len(),
+        plan.groups.iter().map(|g| g.partition_count).sum::<usize>()
+    );
+
+        executor.execute_plan(&plan).await
     }
 }
 
