@@ -7,7 +7,7 @@ use kafka_protocol::messages::{
 };
 use kafka_protocol::protocol::StrBytes;
 use kafka_protocol::records::{Record, RecordBatchDecoder};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use super::KafkaClient;
 use crate::error::KafkaError;
@@ -87,7 +87,7 @@ pub async fn fetch(
                         topic, partition, partition_response.error_code
                     ),
                 }
-                .into());
+                    .into());
             }
 
             high_watermark = partition_response.high_watermark;
@@ -134,6 +134,8 @@ fn decode_records(data: &Bytes) -> Result<Vec<BackupRecord>> {
     let mut records = Vec::new();
 
     while buf.has_remaining() {
+        let bytes_before = buf.remaining();
+
         match RecordBatchDecoder::decode(&mut buf) {
             Ok(record_set) => {
                 for record in &record_set.records {
@@ -146,9 +148,19 @@ fn decode_records(data: &Bytes) -> Result<Vec<BackupRecord>> {
                 break;
             }
             Err(e) => {
-                return Err(
-                    KafkaError::Protocol(format!("Failed to decode records: {:?}", e)).into(),
-                );
+                // If decode failed without consuming any bytes, the buffer
+                // never advances — retrying here would loop forever. Fail
+                // instead of spinning.
+                if buf.remaining() == bytes_before {
+                    return Err(
+                        KafkaError::Protocol(format!("Failed to decode records: {:?}", e)).into(),
+                    );
+                }
+
+                // Bytes were consumed before the failure — safe to skip this
+                // batch and continue with the rest of the buffer.
+                warn!("Skipping unparseable record batch: {:?}", e);
+                continue;
             }
         }
     }
