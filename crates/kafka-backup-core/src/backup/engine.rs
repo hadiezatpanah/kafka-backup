@@ -19,6 +19,7 @@ use crate::segment::format::BinaryRecord;
 use crate::segment::writer::{SegmentWriter, SegmentWriterConfig};
 use crate::storage::{create_backend, StorageBackend};
 use crate::{Error, Result};
+use crate::error::KafkaError;
 
 /// Backup engine for backing up Kafka topics
 pub struct BackupEngine {
@@ -978,10 +979,35 @@ impl BackupPartitionContext {
             let (records, next_offset) = match fetch_result {
                 Ok(data) => data,
                 Err(e) => {
+                    if is_offset_out_of_range(&e) {
+                        warn!(
+                            "{}:{}: offset {} out of range (likely deleted by retention), \
+                             refetching earliest and resuming",
+                            self.topic, self.partition, current_offset
+                        );
+                        match self.router.get_offsets(&self.topic, self.partition).await {
+                            Ok((new_earliest, _)) if new_earliest > current_offset => {
+                                current_offset = new_earliest;
+                                continue;
+                            }
+                            Ok(_) => {
+                                // new_earliest <= current_offset: the out-of-range error
+                                // wasn't a retention gap we can jump past. Fall through
+                                // to the original failure handling below.
+                            }
+                            Err(offset_err) => {
+                                warn!(
+                                    "{}:{}: failed to refetch earliest offset after out-of-range error: {}",
+                                    self.topic, self.partition, offset_err
+                                );
+                                // Fall through to original failure handling below.
+                            }
+                        }
+                    }
+
                     self.health
                         .mark_degraded("kafka", &format!("Fetch error: {}", e));
                     self.kafka_cb.record_failure();
-                    // Record error to Prometheus metrics
                     if let Some(ref prom) = self.prometheus_metrics {
                         let error_type = ErrorType::from_error(&e);
                         prom.record_error(&self.backup_id, error_type);
@@ -1207,6 +1233,13 @@ impl BackupPartitionContext {
             .await?;
 
         Ok((fetch_response.records, fetch_response.next_offset))
+    }
+}
+
+fn is_offset_out_of_range(e: &Error) -> bool {
+    match e {
+        Error::Kafka(KafkaError::BrokerError { code, .. }) => *code == 1,
+        _ => false,
     }
 }
 
