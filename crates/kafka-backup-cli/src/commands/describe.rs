@@ -76,6 +76,17 @@ fn print_manifest_text(manifest: &BackupManifest) {
 
     println!("║ Total Segments: {:55} ║", manifest.total_segments());
     println!("║ Total Records:  {:55} ║", manifest.total_records());
+    let total_gaps = manifest.total_gaps();
+    if total_gaps > 0 {
+        let offsets_missing: i64 = manifest.gaps().map(|(_, _, g)| g.offset_span()).sum();
+        println!(
+            "║ Data Gaps:      {:55} ║",
+            format!(
+                "{} ({} source offsets not captured)",
+                total_gaps, offsets_missing
+            )
+        );
+    }
 
     // Calculate total size
     let total_compressed: u64 = manifest
@@ -173,6 +184,16 @@ fn print_manifest_text(manifest: &BackupManifest) {
                     offset_range.0,
                     offset_range.1,
                     partition.segments.len()
+                );
+            }
+            for gap in &partition.gaps {
+                println!(
+                    "║     P{}: DATA GAP offsets {}..{} ({} offsets not captured: {}) ║",
+                    partition.partition_id,
+                    gap.start_offset,
+                    gap.end_offset,
+                    gap.offset_span(),
+                    gap.reason
                 );
             }
         }
