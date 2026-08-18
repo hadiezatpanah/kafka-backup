@@ -30,6 +30,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   [#146](https://github.com/osodevops/kafka-backup/issues/146).
 - Connection I/O errors are now attributed as `broker_connection` in
   `kafka_backup_errors_total` instead of `unknown`.
+- `PartitionLeaderRouter::fetch` (the backup path) now retries connection
+  errors up to 5 times with linear back-off, dropping cached broker
+  connections in between — the same policy `produce` and `delete_records`
+  already had. `KafkaClient::send_request` still reconnects and retries once
+  immediately; the router loop covers a proxy or broker resetting connections
+  for longer than that single retry, which previously failed the partition and
+  the whole run.
 
 ### Added
 - `KafkaError::ConnectionIo { operation, kind, raw_os_error, message }`
