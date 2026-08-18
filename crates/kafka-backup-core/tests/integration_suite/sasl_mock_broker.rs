@@ -152,7 +152,10 @@ async fn serve_connection(
     }
 }
 
-async fn read_request(stream: &mut TcpStream) -> Option<(ApiKey, i16, i32, Bytes)> {
+/// Read one Kafka request frame: `(api_key, api_version, correlation_id, body)`.
+/// Returns `None` on EOF or a short read. Shared with the connection-error
+/// mock in `issue_146_connection_errors`.
+pub async fn read_request(stream: &mut TcpStream) -> Option<(ApiKey, i16, i32, Bytes)> {
     let mut len_buf = [0u8; 4];
     if stream.read_exact(&mut len_buf).await.is_err() {
         return None;
@@ -190,7 +193,8 @@ fn decode_authenticate_body(body: &Bytes, api_version: i16) -> Vec<u8> {
     req.auth_bytes.to_vec()
 }
 
-async fn write_response<Resp: Encodable>(
+/// Frame and write one Kafka response for `correlation_id`.
+pub async fn write_response<Resp: Encodable>(
     stream: &mut TcpStream,
     api_key: ApiKey,
     api_version: i16,
