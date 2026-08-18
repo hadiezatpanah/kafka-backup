@@ -363,6 +363,37 @@ This ensures consistent "point-in-time" snapshots for disaster recovery, even wi
 
 > **Note:** `stop_at_current_offsets` is incompatible with `continuous: true`. Use snapshot mode for scheduled backups (CronJobs), and continuous mode for streaming replication.
 
+#### Retention deleting data before it is fetched
+
+The offsets a backup starts from are captured before the fetch happens — for
+every partition up front in snapshot mode, and from the checkpoint on resume.
+With many partitions, bounded `max_concurrent_partitions`, or a long gap
+between runs, retention can delete those offsets before the partition's turn
+comes up. The broker then rejects the fetch with `OFFSET_OUT_OF_RANGE`.
+
+The backup does **not** fail in that case. It re-reads the partition's current
+log start offset, resumes from there, and records the skipped range as an
+**offset gap** in the manifest:
+
+```json
+{
+  "partition_id": 7,
+  "segments": [ ... ],
+  "gaps": [
+    { "start_offset": 0, "end_offset": 100000,
+      "reason": "offset_out_of_range", "detected_at": 1755522569000 }
+  ]
+}
+```
+
+Records inside a gap were deleted from the source before they could be
+fetched and cannot be recovered. `kafka-backup validate` and
+`kafka-backup describe` list recorded gaps, and the
+`kafka_backup_offset_gaps_total` / `kafka_backup_offsets_skipped_total`
+counters let you alert on them. If gaps appear regularly, raise
+`max_concurrent_partitions`, shorten the interval between runs, or increase
+the topic's retention so a full run fits inside the retention window.
+
 ### Compression Options
 
 | Algorithm | Description |
@@ -525,6 +556,8 @@ metrics:
 | `kafka_backup_snapshot_records_remaining` | Gauge | Captured snapshot offset span still to process |
 | `kafka_backup_records_total` | Counter | Total records backed up |
 | `kafka_backup_bytes_total` | Counter | Total bytes backed up |
+| `kafka_backup_offset_gaps_total` | Counter | Offset ranges skipped because the source no longer had the records (see [retention gaps](#retention-deleting-data-before-it-is-fetched)) |
+| `kafka_backup_offsets_skipped_total` | Counter | Source offsets skipped across all recorded gaps |
 | `kafka_backup_compression_ratio` | Gauge | Compression efficiency |
 | `kafka_backup_storage_write_latency_seconds` | Histogram | Storage write latency |
 | `kafka_backup_storage_write_bytes_total` | Counter | Storage I/O bytes |
