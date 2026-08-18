@@ -112,6 +112,56 @@ source:
     ssl_ca_location: /etc/kafka/certs/ca.pem
 ```
 
+### Connection Options
+
+TCP-level settings for the source (and, for restore, the target) cluster.
+All are optional and live under `source.connection` / `target.connection`.
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `connection.tcp_keepalive` | bool | `true` | Send TCP keepalive probes so idle connections are not silently dropped by NATs, load balancers or cloud Kafka front-ends |
+| `connection.keepalive_time_secs` | integer | `60` | Idle time before the first keepalive probe |
+| `connection.keepalive_interval_secs` | integer | `20` | Interval between keepalive probes |
+| `connection.tcp_nodelay` | bool | `true` | Disable Nagle's algorithm (lower request latency) |
+| `connection.connections_per_broker` | integer | `4` | TCP connections kept per broker; concurrent partitions share them, so raise this on high-latency links |
+
+```yaml
+source:
+  bootstrap_servers: ["kafka1.example.com:9092"]
+  connection:
+    tcp_keepalive: true
+    keepalive_time_secs: 30
+    keepalive_interval_secs: 10
+    connections_per_broker: 8
+```
+
+#### Connection loss and automatic reconnect
+
+A dropped or reset broker connection does not fail a run. When a request
+fails with a connection-level error the client reconnects (TCP, TLS and SASL
+again) and retries the request once, immediately; the backup fetch path,
+restore produce path and record purging additionally retry up to 5 times with
+linear back-off (0.5 s, 1 s, … 2.5 s), so a broker or proxy that resets
+connections for a few seconds is ridden out. What counts as a connection-level
+error is decided from the OS error *kind* and code — connection reset,
+aborted or refused, broken pipe, not connected, timed out, unexpected EOF,
+network/host unreachable, and the Windows Winsock equivalents (`10052`,
+`10053`, `10054`, `10057`, `10058`, `10060`, `10061`) — not from the error
+message text, which is localized and differs per platform.
+
+You will see it in the logs as:
+
+```
+WARN kafka_backup_core::kafka::client: Connection error on Fetch request, reconnecting and retrying: Kafka error: Connection error during read response length (ConnectionReset): Connection reset by peer (os error 104)
+WARN kafka_backup_core::kafka::partition_router: Connection error fetching orders/3 (attempt 1/5), retrying after 500ms: ...
+```
+
+Such errors are counted under `error_type="broker_connection"` in
+`kafka_backup_errors_total`. If a run still fails after the retries, the
+outage lasted longer than the retry window (roughly 8 s per request); check
+broker availability and the keepalive settings above, and simply re-run — a
+backup resumes from its checkpoint.
+
 ### TLS/SSL Configuration
 
 kafka-backup supports TLS encryption for Kafka connections, including custom CA certificates and mutual TLS (mTLS) authentication.
