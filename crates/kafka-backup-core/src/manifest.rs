@@ -70,6 +70,30 @@ impl BackupManifest {
             .map(|p| p.segments.len())
             .sum()
     }
+
+    /// Number of recorded offset gaps across all partitions (see [`OffsetGap`]).
+    ///
+    /// Zero means the backup captured every offset it set out to. Non-zero
+    /// means the source no longer had some records by the time they were
+    /// fetched, and this backup is knowingly incomplete for those ranges.
+    pub fn total_gaps(&self) -> usize {
+        self.topics
+            .iter()
+            .flat_map(|t| &t.partitions)
+            .map(|p| p.gaps.len())
+            .sum()
+    }
+
+    /// Iterate over every recorded offset gap as `(topic, partition, gap)`.
+    pub fn gaps(&self) -> impl Iterator<Item = (&str, i32, &OffsetGap)> {
+        self.topics.iter().flat_map(|t| {
+            t.partitions.iter().flat_map(move |p| {
+                p.gaps
+                    .iter()
+                    .map(move |g| (t.name.as_str(), p.partition_id, g))
+            })
+        })
+    }
 }
 
 /// Per-topic backup metadata
@@ -103,6 +127,7 @@ impl TopicBackup {
             self.partitions.push(PartitionBackup {
                 partition_id,
                 segments: Vec::new(),
+                gaps: Vec::new(),
             });
         }
         self.partitions
@@ -120,6 +145,14 @@ pub struct PartitionBackup {
 
     /// Segments for this partition
     pub segments: Vec<SegmentMetadata>,
+
+    /// Source offset ranges this backup could not capture (see [`OffsetGap`]).
+    ///
+    /// Empty for a backup with no known data loss. Omitted from the JSON when
+    /// empty, and absent from manifests written before 0.17 — both read back
+    /// as an empty list. Sorted by `start_offset`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gaps: Vec<OffsetGap>,
 }
 
 impl PartitionBackup {
@@ -131,6 +164,75 @@ impl PartitionBackup {
     /// Add a new segment
     pub fn add_segment(&mut self, segment: SegmentMetadata) {
         self.segments.push(segment);
+    }
+
+    /// Record an offset gap, keeping `gaps` sorted and free of duplicates.
+    ///
+    /// A gap with the same `start_offset` as an existing one is ignored: the
+    /// same range can be re-detected when a run is resumed before its
+    /// checkpoint advanced past the gap, and merging manifests must not
+    /// double-count it.
+    pub fn add_gap(&mut self, gap: OffsetGap) {
+        if self.gaps.iter().any(|g| g.start_offset == gap.start_offset) {
+            return;
+        }
+        self.gaps.push(gap);
+        self.gaps.sort_by_key(|g| g.start_offset);
+    }
+}
+
+/// A contiguous range of source offsets that this backup could not capture
+/// because the broker no longer had them when the partition was fetched.
+///
+/// Recorded when the broker returns `OFFSET_OUT_OF_RANGE` for the offset the
+/// backup wanted next and its log start offset has already moved past it —
+/// typically retention (or `DeleteRecords`) deleting data between snapshot
+/// capture / checkpoint and the fetch (issue #144). The backup resumes from
+/// `end_offset`; records in `[start_offset, end_offset)` are permanently
+/// absent from this backup and cannot be recovered from the source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OffsetGap {
+    /// First missing offset (inclusive).
+    pub start_offset: i64,
+
+    /// First offset after the gap (exclusive) — the offset the backup
+    /// resumed from.
+    pub end_offset: i64,
+
+    /// Why the gap occurred.
+    pub reason: OffsetGapReason,
+
+    /// When the gap was detected (epoch milliseconds).
+    pub detected_at: i64,
+}
+
+impl OffsetGap {
+    /// Number of offsets in `[start_offset, end_offset)`.
+    ///
+    /// This is an upper bound on the number of records lost: on compacted or
+    /// transactional topics some offsets in the range may never have held a
+    /// record by the time they were deleted.
+    pub fn offset_span(&self) -> i64 {
+        (self.end_offset - self.start_offset).max(0)
+    }
+}
+
+/// Why an [`OffsetGap`] was recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum OffsetGapReason {
+    /// The broker returned `OFFSET_OUT_OF_RANGE` for the requested offset and
+    /// its log start offset had advanced past it: the records were deleted by
+    /// retention or `DeleteRecords` before the backup reached them.
+    OffsetOutOfRange,
+}
+
+impl std::fmt::Display for OffsetGapReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OffsetGapReason::OffsetOutOfRange => write!(f, "offset_out_of_range"),
+        }
     }
 }
 
@@ -1169,5 +1271,107 @@ mod tests {
         let e = m.entries.get("t/0").unwrap();
         assert_eq!(e.target_first_offset, Some(5000));
         assert_eq!(e.target_last_offset, Some(5099));
+    }
+
+    // ------------------------------------------------------------------
+    // Offset gaps (issue #144)
+    // ------------------------------------------------------------------
+
+    fn gap(start: i64, end: i64) -> OffsetGap {
+        OffsetGap {
+            start_offset: start,
+            end_offset: end,
+            reason: OffsetGapReason::OffsetOutOfRange,
+            detected_at: 1_700_000_000_000,
+        }
+    }
+
+    #[test]
+    fn offset_gap_span_is_non_negative() {
+        assert_eq!(gap(100, 250).offset_span(), 150);
+        assert_eq!(gap(100, 100).offset_span(), 0);
+        assert_eq!(gap(100, 50).offset_span(), 0);
+    }
+
+    #[test]
+    fn partition_add_gap_dedups_by_start_and_sorts() {
+        let mut manifest = BackupManifest::new("b".to_string());
+        let part = manifest
+            .get_or_create_topic("orders")
+            .get_or_create_partition(0);
+        assert!(part.gaps.is_empty());
+
+        part.add_gap(gap(300, 400));
+        part.add_gap(gap(100, 200));
+        part.add_gap(gap(100, 250)); // same start — ignored, first wins
+        assert_eq!(part.gaps, vec![gap(100, 200), gap(300, 400)]);
+
+        assert_eq!(manifest.total_gaps(), 2);
+        let collected: Vec<_> = manifest.gaps().collect();
+        assert_eq!(collected.len(), 2);
+        assert_eq!(collected[0].0, "orders");
+        assert_eq!(collected[0].1, 0);
+        assert_eq!(collected[0].2, &gap(100, 200));
+    }
+
+    #[test]
+    fn offset_gap_serde_round_trip() {
+        let mut manifest = BackupManifest::new("b".to_string());
+        manifest
+            .get_or_create_topic("orders")
+            .get_or_create_partition(2)
+            .add_gap(gap(100, 200));
+
+        let json = serde_json::to_string(&manifest).unwrap();
+        assert!(json.contains("\"gaps\""), "{json}");
+        assert!(
+            json.contains("\"reason\":\"offset_out_of_range\""),
+            "reason must be a stable snake_case string: {json}"
+        );
+
+        let back: BackupManifest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.topics[0].partitions[0].gaps, vec![gap(100, 200)]);
+    }
+
+    #[test]
+    fn empty_gaps_are_omitted_from_json() {
+        let mut manifest = BackupManifest::new("b".to_string());
+        manifest
+            .get_or_create_topic("orders")
+            .get_or_create_partition(0);
+        let json = serde_json::to_string(&manifest).unwrap();
+        assert!(
+            !json.contains("gaps"),
+            "a backup with no gaps must not advertise a gaps field: {json}"
+        );
+    }
+
+    #[test]
+    fn manifest_written_before_gaps_existed_still_parses() {
+        // Exactly what a 0.16 manifest looks like: no `gaps` key at all.
+        let legacy = r#"{
+            "backup_id": "old",
+            "created_at": 1700000000000,
+            "topics": [{
+                "name": "orders",
+                "partitions": [{
+                    "partition_id": 0,
+                    "segments": [{
+                        "key": "old/topics/orders/partition=0/segment-0.bin",
+                        "start_offset": 0,
+                        "end_offset": 99,
+                        "start_timestamp": 0,
+                        "end_timestamp": 99000,
+                        "record_count": 100,
+                        "uncompressed_size": 1,
+                        "compressed_size": 1
+                    }]
+                }]
+            }]
+        }"#;
+        let manifest: BackupManifest = serde_json::from_str(legacy).unwrap();
+        assert!(manifest.topics[0].partitions[0].gaps.is_empty());
+        assert_eq!(manifest.total_gaps(), 0);
+        assert_eq!(manifest.gaps().count(), 0);
     }
 }
