@@ -78,6 +78,14 @@ pub struct PrometheusMetrics {
     /// Cumulative bytes backed up.
     pub bytes_total: Family<BackupLabels, Counter>,
 
+    /// Offset gaps recorded because the source no longer had the records
+    /// (issue #144). Each increment is one contiguous range skipped.
+    pub offset_gaps_total: Family<BackupLabels, Counter>,
+
+    /// Cumulative source offsets skipped across all recorded gaps. An upper
+    /// bound on records permanently missing from the backup.
+    pub offsets_skipped_total: Family<BackupLabels, Counter>,
+
     // ========================================
     // Operation Duration Metrics
     // ========================================
@@ -202,6 +210,8 @@ impl PrometheusMetrics {
         let throughput_bytes_per_sec = Family::<ThroughputLabels, Gauge<f64, AtomicU64>>::default();
         let records_total = Family::<BackupLabels, Counter>::default();
         let bytes_total = Family::<BackupLabels, Counter>::default();
+        let offset_gaps_total = Family::<BackupLabels, Counter>::default();
+        let offsets_skipped_total = Family::<BackupLabels, Counter>::default();
 
         // Operation Duration Metrics
         let backup_duration_seconds =
@@ -303,6 +313,16 @@ impl PrometheusMetrics {
             "kafka_backup_bytes",
             "Cumulative bytes backed up",
             bytes_total.clone(),
+        );
+        registry.register(
+            "kafka_backup_offset_gaps",
+            "Offset ranges skipped because the source no longer had the records",
+            offset_gaps_total.clone(),
+        );
+        registry.register(
+            "kafka_backup_offsets_skipped",
+            "Cumulative source offsets skipped across all recorded gaps",
+            offsets_skipped_total.clone(),
         );
 
         // Operation Duration Metrics
@@ -418,6 +438,8 @@ impl PrometheusMetrics {
             throughput_bytes_per_sec,
             records_total,
             bytes_total,
+            offset_gaps_total,
+            offsets_skipped_total,
             backup_duration_seconds,
             restore_duration_seconds,
             storage_write_latency_seconds,
@@ -576,6 +598,16 @@ impl PrometheusMetrics {
     pub fn inc_records(&self, backup_id: &str, count: u64) {
         let labels = BackupLabels::new(backup_id);
         self.records_total.get_or_create(&labels).inc_by(count);
+    }
+
+    /// Record an offset gap: the backup skipped `offsets_skipped` source
+    /// offsets because the broker no longer had them (issue #144).
+    pub fn record_offset_gap(&self, backup_id: &str, offsets_skipped: i64) {
+        let labels = BackupLabels::new(backup_id);
+        self.offset_gaps_total.get_or_create(&labels).inc();
+        self.offsets_skipped_total
+            .get_or_create(&labels)
+            .inc_by(offsets_skipped.max(0) as u64);
     }
 
     /// Increment cumulative bytes counter.
@@ -914,6 +946,24 @@ mod tests {
         let encoded = metrics.encode();
         assert!(encoded.contains("kafka_backup_errors"));
         assert!(encoded.contains("broker_connection"));
+    }
+
+    #[test]
+    fn test_record_offset_gap() {
+        let metrics = PrometheusMetrics::new();
+        metrics.record_offset_gap("backup-001", 150);
+        metrics.record_offset_gap("backup-001", 50);
+        metrics.record_offset_gap("backup-001", -5); // clamped to 0, still one gap event
+
+        let encoded = metrics.encode();
+        assert!(
+            encoded.contains("kafka_backup_offset_gaps_total{backup_id=\"backup-001\"} 3"),
+            "{encoded}"
+        );
+        assert!(
+            encoded.contains("kafka_backup_offsets_skipped_total{backup_id=\"backup-001\"} 200"),
+            "{encoded}"
+        );
     }
 
     #[test]

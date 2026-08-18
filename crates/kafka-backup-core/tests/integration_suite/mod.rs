@@ -9,8 +9,10 @@
 //! - TLS Security: SSL/TLS certificate handling tests
 //! - Snapshot Backup: stop_at_current_offsets feature tests
 //! - Performance Issues: Issue #29 constant lag and throughput tests
+//! - Issue #144: OFFSET_OUT_OF_RANGE recovery and data-gap recording
 
 pub mod common;
+pub mod issue_144_offset_out_of_range;
 pub mod issue_56_missing_topic;
 pub mod issue_67_fixes;
 pub mod offset_semantics;

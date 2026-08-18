@@ -14,6 +14,12 @@ struct ValidationReport {
     segments_corrupted: usize,
     records_validated: u64,
     issues: Vec<String>,
+    /// Offset ranges the backup itself recorded as missing (retention deleted
+    /// them before they could be fetched — see `OffsetGap`). These are not
+    /// integrity failures: the stored data is intact, but the backup is
+    /// knowingly incomplete for these ranges.
+    data_gaps: Vec<String>,
+    offsets_missing: i64,
 }
 
 impl ValidationReport {
@@ -28,6 +34,7 @@ impl ValidationReport {
         println!("Segments Missing:   {}", self.segments_missing);
         println!("Segments Corrupted: {}", self.segments_corrupted);
         println!("Records Validated:  {}", self.records_validated);
+        println!("Data Gaps:          {}", self.data_gaps.len());
 
         if !self.issues.is_empty() {
             println!("\nIssues Found:");
@@ -36,11 +43,25 @@ impl ValidationReport {
             }
         }
 
+        if !self.data_gaps.is_empty() {
+            println!(
+                "\nData Gaps (recorded during backup — {} source offsets could not be captured \
+                 because the broker no longer had them):",
+                self.offsets_missing
+            );
+            for gap in &self.data_gaps {
+                println!("  - {}", gap);
+            }
+        }
+
         println!();
-        if self.is_valid() {
-            println!("Result: VALID");
-        } else {
-            println!("Result: INVALID");
+        match (self.is_valid(), self.data_gaps.is_empty()) {
+            (true, true) => println!("Result: VALID"),
+            (true, false) => println!(
+                "Result: VALID (with {} recorded data gaps — backup is intact but incomplete)",
+                self.data_gaps.len()
+            ),
+            (false, _) => println!("Result: INVALID"),
         }
     }
 }
@@ -84,6 +105,24 @@ pub async fn run(path: &str, backup_id: &str, deep: bool) -> Result<()> {
             .unwrap_or_else(|| "Unknown".to_string())
     );
     println!();
+
+    // Surface any data gaps the backup recorded about itself (issue #144).
+    for (topic, partition, gap) in manifest.gaps() {
+        let detected = chrono::DateTime::from_timestamp_millis(gap.detected_at)
+            .map(|dt| dt.to_rfc3339())
+            .unwrap_or_else(|| gap.detected_at.to_string());
+        report.data_gaps.push(format!(
+            "{}:{} offsets {}..{} ({} offsets, {}, detected {})",
+            topic,
+            partition,
+            gap.start_offset,
+            gap.end_offset,
+            gap.offset_span(),
+            gap.reason,
+            detected
+        ));
+        report.offsets_missing += gap.offset_span();
+    }
 
     // Validate each segment
     for topic in &manifest.topics {

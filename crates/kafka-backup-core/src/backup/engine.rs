@@ -10,9 +10,10 @@ use tracing::{debug, error, info, warn};
 use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use crate::compression::extension;
 use crate::config::{BackupOptions, CompressionType, Config, Mode, StartOffset, TopicSelection};
+use crate::error::KafkaError;
 use crate::health::HealthCheck;
 use crate::kafka::{PartitionLeaderRouter, TopicMetadata};
-use crate::manifest::{BackupManifest, BackupRecord, SegmentMetadata};
+use crate::manifest::{BackupManifest, BackupRecord, OffsetGap, OffsetGapReason, SegmentMetadata};
 use crate::metrics::{ErrorType, PerformanceMetrics, PrometheusMetrics};
 use crate::offset_store::{OffsetStore, OffsetStoreConfig, SqliteOffsetStore};
 use crate::segment::format::BinaryRecord;
@@ -978,10 +979,58 @@ impl BackupPartitionContext {
             let (records, next_offset) = match fetch_result {
                 Ok(data) => data,
                 Err(e) => {
+                    // OFFSET_OUT_OF_RANGE (issue #144): the offset we want was
+                    // captured earlier (snapshot or checkpoint) and retention has
+                    // since deleted it. Re-read the broker's log start offset and
+                    // resume from there rather than failing the partition — but
+                    // record the skipped range durably first: those records are
+                    // gone from the source, and a backup that silently contains
+                    // a hole is worse than one that fails loudly.
+                    let e = if is_offset_out_of_range(&e) {
+                        warn!(
+                            "{}:{}: offset {} out of range (likely deleted by retention), \
+                             refetching earliest and resuming",
+                            self.topic, self.partition, current_offset
+                        );
+                        match self.router.get_offsets(&self.topic, self.partition).await {
+                            Ok((new_earliest, _)) if new_earliest > current_offset => {
+                                // Only the part of the gap inside this run's target
+                                // range counts as lost *for this backup*; anything
+                                // past `end_offset` was never going to be captured.
+                                let gap_end = new_earliest.min(end_offset);
+                                self.record_offset_gap(current_offset, gap_end).await;
+                                current_offset = new_earliest;
+                                continue;
+                            }
+                            Ok((new_earliest, new_latest)) => {
+                                // The log start offset has NOT moved past us, so this
+                                // is not a retention gap we can jump over: the offset
+                                // is beyond the log end (log truncated or topic
+                                // recreated underneath us). Not recoverable here —
+                                // fail with a message that says which case it is.
+                                out_of_range_error(
+                                    &self.topic,
+                                    self.partition,
+                                    current_offset,
+                                    new_earliest,
+                                    new_latest,
+                                )
+                            }
+                            Err(offset_err) => {
+                                warn!(
+                                    "{}:{}: failed to refetch earliest offset after out-of-range error: {}",
+                                    self.topic, self.partition, offset_err
+                                );
+                                e
+                            }
+                        }
+                    } else {
+                        e
+                    };
+
                     self.health
                         .mark_degraded("kafka", &format!("Fetch error: {}", e));
                     self.kafka_cb.record_failure();
-                    // Record error to Prometheus metrics
                     if let Some(ref prom) = self.prometheus_metrics {
                         let error_type = ErrorType::from_error(&e);
                         prom.record_error(&self.backup_id, error_type);
@@ -1176,6 +1225,54 @@ impl BackupPartitionContext {
         partition_backup.add_segment(segment_metadata);
     }
 
+    /// Record that offsets `[start_offset, end_offset)` are permanently missing
+    /// from this backup (issue #144): manifest entry, Prometheus counters,
+    /// snapshot progress, and a best-effort manifest save so the gap survives
+    /// a crash before the next segment flush.
+    async fn record_offset_gap(&self, start_offset: i64, end_offset: i64) {
+        let gap = OffsetGap {
+            start_offset,
+            end_offset,
+            reason: OffsetGapReason::OffsetOutOfRange,
+            detected_at: chrono::Utc::now().timestamp_millis(),
+        };
+        let span = gap.offset_span();
+        if span == 0 {
+            return;
+        }
+
+        warn!(
+            "{}:{}: recording data gap [{}, {}) — {} offsets permanently missing from backup {} \
+             (deleted from the source before they could be fetched)",
+            self.topic, self.partition, start_offset, end_offset, span, self.backup_id
+        );
+
+        {
+            let mut manifest = self.manifest.lock().await;
+            manifest
+                .get_or_create_topic(&self.topic)
+                .get_or_create_partition(self.partition)
+                .add_gap(gap);
+        }
+
+        if let Some(ref prom) = self.prometheus_metrics {
+            prom.record_offset_gap(&self.backup_id, span);
+            // The skipped span still counts towards the captured snapshot's
+            // remaining offsets, otherwise the progress gauge never reaches
+            // zero for a partition that recovered from a gap.
+            if self.target_offset.is_some() {
+                prom.advance_snapshot_progress(&self.backup_id, span);
+            }
+        }
+
+        if let Err(e) = self.manifest_persistence.save_now().await {
+            warn!(
+                "Best-effort manifest save failed for {}:{} after recording data gap: {}",
+                self.topic, self.partition, e
+            );
+        }
+    }
+
     async fn persist_progress_best_effort(&self, reason: &str) {
         if let Err(e) = self.manifest_persistence.save_now().await {
             warn!(
@@ -1208,6 +1305,46 @@ impl BackupPartitionContext {
 
         Ok((fetch_response.records, fetch_response.next_offset))
     }
+}
+
+/// Kafka protocol error code for OFFSET_OUT_OF_RANGE.
+const OFFSET_OUT_OF_RANGE: i16 = 1;
+
+/// True if `e` is the broker rejecting a Fetch with OFFSET_OUT_OF_RANGE.
+fn is_offset_out_of_range(e: &Error) -> bool {
+    matches!(
+        e,
+        Error::Kafka(KafkaError::BrokerError {
+            code: OFFSET_OUT_OF_RANGE,
+            ..
+        })
+    )
+}
+
+/// Build the error for an OFFSET_OUT_OF_RANGE that cannot be recovered by
+/// skipping forward: the broker's log start offset (`earliest`) has not moved
+/// past `offset`, so the fetch position must be beyond the log end instead.
+/// Keeps error code 1 so metrics still classify it as `OffsetInvalid`.
+fn out_of_range_error(
+    topic: &str,
+    partition: i32,
+    offset: i64,
+    earliest: i64,
+    latest: i64,
+) -> Error {
+    let cause = if offset >= latest {
+        "beyond the log end offset (log truncated or topic recreated?)"
+    } else {
+        "inside the broker's reported range (leader change or replica inconsistency?)"
+    };
+    Error::Kafka(KafkaError::BrokerError {
+        code: OFFSET_OUT_OF_RANGE,
+        message: format!(
+            "Fetch offset {} for {}:{} is out of range and cannot be recovered by skipping \
+             forward: broker log range is [{}, {}), offset is {}",
+            offset, topic, partition, earliest, latest, cause
+        ),
+    })
 }
 
 /// Maximum bytes to request per Fetch call: an explicit `fetch_max_bytes`
@@ -1266,7 +1403,8 @@ async fn save_manifest_snapshot(
 ///   - Partitions only in existing → preserved
 ///   - Partitions only in current  → appended
 ///   - Partitions in both: segments deduplicated by (key, start_offset); existing wins on
-///     conflict. Output sorted by start_offset.
+///     conflict. Output sorted by start_offset. Offset gaps are unioned, deduplicated by
+///     start_offset.
 fn merge_manifests(mut existing: BackupManifest, current: BackupManifest) -> BackupManifest {
     use std::collections::HashMap as HM;
 
@@ -1307,6 +1445,11 @@ fn merge_manifests(mut existing: BackupManifest, current: BackupManifest) -> Bac
                         }
                     }
                     ex_part.segments.sort_by_key(|s| s.start_offset);
+                    // Gaps recorded by the current session are unioned in;
+                    // add_gap dedups by start_offset and keeps them sorted.
+                    for gap in cur_part.gaps {
+                        ex_part.add_gap(gap);
+                    }
                 } else {
                     ex_topic.partitions.push(cur_part);
                 }
@@ -1550,6 +1693,7 @@ mod tests {
         PartitionBackup {
             partition_id: id,
             segments,
+            gaps: Vec::new(),
         }
     }
 
@@ -1839,5 +1983,112 @@ mod tests {
         let merged = merge_manifests(existing, current);
         assert_eq!(merged.topics.len(), 1);
         assert_eq!(merged.topics[0].name, "orders");
+    }
+
+    // ------------------------------------------------------------------
+    // Issue #144: OFFSET_OUT_OF_RANGE recovery
+    // ------------------------------------------------------------------
+
+    fn broker_error(code: i16) -> Error {
+        Error::Kafka(KafkaError::BrokerError {
+            code,
+            message: format!("Fetch error for t:0: code {code}"),
+        })
+    }
+
+    #[test]
+    fn test_is_offset_out_of_range_matches_only_code_1() {
+        assert!(is_offset_out_of_range(&broker_error(1)));
+        // NOT_LEADER_FOR_PARTITION and other broker codes are not retention gaps.
+        assert!(!is_offset_out_of_range(&broker_error(6)));
+        assert!(!is_offset_out_of_range(&broker_error(0)));
+        // Non-broker errors never match, even if they mention "code 1".
+        assert!(!is_offset_out_of_range(&Error::Kafka(
+            KafkaError::Protocol("code 1".to_string())
+        )));
+        assert!(!is_offset_out_of_range(&Error::Compression(
+            "code 1".to_string()
+        )));
+    }
+
+    #[test]
+    fn test_out_of_range_error_keeps_code_1_and_explains_cause() {
+        // Beyond the log end: truncation / topic recreated.
+        let e = out_of_range_error("orders", 3, 5_000, 100, 4_000);
+        assert!(is_offset_out_of_range(&e), "must still classify as code 1");
+        let msg = e.to_string();
+        assert!(msg.contains("orders:3"), "{msg}");
+        assert!(msg.contains("5000"), "{msg}");
+        assert!(msg.contains("[100, 4000)"), "{msg}");
+        assert!(msg.contains("beyond the log end"), "{msg}");
+
+        // Inside the reported range: leader change / replica inconsistency.
+        let e = out_of_range_error("orders", 3, 2_000, 100, 4_000);
+        assert!(is_offset_out_of_range(&e));
+        assert!(e.to_string().contains("inside the broker's reported range"));
+    }
+
+    fn make_gap(start: i64, end: i64) -> OffsetGap {
+        OffsetGap {
+            start_offset: start,
+            end_offset: end,
+            reason: OffsetGapReason::OffsetOutOfRange,
+            detected_at: 1_700_000_000_000,
+        }
+    }
+
+    #[test]
+    fn test_merge_manifests_unions_and_dedups_gaps() {
+        // Existing manifest (from an earlier save in the same run, or an
+        // earlier run) already carries a gap; the current session re-detected
+        // the same gap and found a new one.
+        let mut ex_part = make_partition(0, vec![make_segment("seg-a", 200, 299)]);
+        ex_part.add_gap(make_gap(100, 200));
+        let mut existing = BackupManifest::new("test".to_string());
+        existing
+            .topics
+            .push(make_topic("orders", Some(1), vec![ex_part]));
+
+        let mut cur_part = make_partition(0, vec![make_segment("seg-b", 500, 599)]);
+        cur_part.add_gap(make_gap(100, 200)); // duplicate — must not double count
+        cur_part.add_gap(make_gap(300, 500)); // new
+        let mut current = BackupManifest::new("test".to_string());
+        current
+            .topics
+            .push(make_topic("orders", Some(1), vec![cur_part]));
+
+        let merged = merge_manifests(existing, current);
+        let part = &merged.topics[0].partitions[0];
+        assert_eq!(part.segments.len(), 2);
+        assert_eq!(
+            part.gaps,
+            vec![make_gap(100, 200), make_gap(300, 500)],
+            "gaps are unioned, deduplicated by start_offset, and sorted"
+        );
+        assert_eq!(merged.total_gaps(), 2);
+    }
+
+    #[test]
+    fn test_merge_manifests_keeps_gaps_on_new_partition() {
+        // Partition only in `current` is appended wholesale, gaps included.
+        let mut cur_part = make_partition(1, vec![make_segment("seg-b", 50, 99)]);
+        cur_part.add_gap(make_gap(0, 50));
+        let mut current = BackupManifest::new("test".to_string());
+        current
+            .topics
+            .push(make_topic("orders", Some(2), vec![cur_part]));
+
+        let mut existing = BackupManifest::new("test".to_string());
+        existing.topics.push(make_topic(
+            "orders",
+            Some(2),
+            vec![make_partition(0, vec![make_segment("seg-a", 0, 99)])],
+        ));
+
+        let merged = merge_manifests(existing, current);
+        assert_eq!(merged.total_gaps(), 1);
+        let (topic, partition, gap) = merged.gaps().next().unwrap();
+        assert_eq!((topic, partition), ("orders", 1));
+        assert_eq!(gap, &make_gap(0, 50));
     }
 }

@@ -5,6 +5,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.17.0] - 2026-08-18
+
+### Fixed
+- Recover from `OFFSET_OUT_OF_RANGE` (broker error code 1) during backup
+  instead of failing the partition. In snapshot mode the `earliest` offset is
+  captured for every partition up front, and on resume the start offset comes
+  from the checkpoint; if retention deletes that offset before the partition is
+  fetched, the fetch loop now re-reads the broker's log start offset and
+  resumes from there. Previously the whole run failed — and a resumed backup
+  whose checkpoint had aged out of retention failed identically on every retry
+  and never self-healed. Fixes
+  [#144](https://github.com/osodevops/kafka-backup/issues/144).
+
+### Added
+- The range skipped by an `OFFSET_OUT_OF_RANGE` recovery is recorded durably as
+  an offset gap in the manifest (`topics[].partitions[].gaps[]`, with
+  `start_offset`, `end_offset`, `reason`, `detected_at`) rather than only being
+  logged: those records are gone from the source, and a backup that silently
+  contains a hole is worse than one that fails loudly. `validate` and
+  `describe` list recorded gaps; `describe --format json` includes them
+  verbatim.
+- Prometheus counters `kafka_backup_offset_gaps_total` (gap events) and
+  `kafka_backup_offsets_skipped_total` (source offsets skipped), labelled by
+  `backup_id`, so operators can alert on data loss.
+- `BackupManifest::total_gaps()` / `gaps()`, `PartitionBackup::add_gap()`,
+  and the `OffsetGap` / `OffsetGapReason` types in `kafka-backup-core`.
+
+### Changed
+- `kafka-backup-core`: `PartitionBackup` gained the public `gaps` field
+  (breaking for struct-literal construction). Manifests written by earlier
+  versions load unchanged — the field defaults to empty and is omitted from
+  the JSON when empty.
+- An `OFFSET_OUT_OF_RANGE` that cannot be recovered by skipping forward (the
+  broker's log start offset has not moved past the fetch offset, so the offset
+  is beyond the log end — truncation or a recreated topic) still fails the
+  partition, now with an error that reports the broker's log range and the
+  likely cause instead of a bare `code 1`.
+
 ## [0.16.0] - 2026-08-11
 
 ### Added
