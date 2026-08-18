@@ -898,18 +898,11 @@ fn group_partition_offsets_by_leader(
 }
 
 /// Check if an error is a connection-level error that warrants a retry.
+///
+/// Shares the classifier with `KafkaClient::send_request` (issue #146) so the
+/// produce / delete-records retry loops recognise the same set of failures.
 fn is_connection_error(error: &crate::Error) -> bool {
-    match error {
-        crate::Error::Kafka(KafkaError::Protocol(msg)) => {
-            msg.contains("Broken pipe")
-                || msg.contains("early eof")
-                || msg.contains("Connection reset")
-                || msg.contains("Not connected")
-                || msg.contains("connection abort")
-                || msg.contains("timed out after")
-        }
-        _ => false,
-    }
+    super::connection_error::is_connection_error(error)
 }
 
 /// Check if an error is a NOT_LEADER_FOR_PARTITION error (code 6).

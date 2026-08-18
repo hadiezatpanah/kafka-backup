@@ -308,6 +308,7 @@ impl ErrorType {
     fn classify_kafka_error(error: &crate::error::KafkaError) -> Self {
         match error {
             crate::error::KafkaError::ConnectionFailed { .. } => ErrorType::BrokerConnection,
+            crate::error::KafkaError::ConnectionIo { .. } => ErrorType::BrokerConnection,
             crate::error::KafkaError::Protocol(_) => ErrorType::Unknown,
             crate::error::KafkaError::BrokerError { code, .. } => {
                 // Classify based on Kafka error codes
@@ -422,6 +423,20 @@ mod tests {
         assert_eq!(ErrorType::BrokerConnection.as_str(), "broker_connection");
         assert_eq!(ErrorType::StorageIo.as_str(), "storage_io");
         assert_eq!(ErrorType::Auth.as_str(), "auth");
+    }
+
+    #[test]
+    fn connection_io_errors_count_as_broker_connection() {
+        // Issue #146: I/O failures on the broker socket used to surface as
+        // `Protocol(String)` and were counted as `unknown` in
+        // kafka_backup_errors_total. The structured variant is attributable.
+        let err = crate::Error::Kafka(crate::error::KafkaError::ConnectionIo {
+            operation: "send request".into(),
+            kind: std::io::ErrorKind::ConnectionAborted,
+            raw_os_error: Some(10053),
+            message: "An established connection was aborted by the software in your host machine. (os error 10053)".into(),
+        });
+        assert_eq!(ErrorType::from_error(&err), ErrorType::BrokerConnection);
     }
 
     #[test]

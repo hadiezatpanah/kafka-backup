@@ -2,6 +2,7 @@
 
 mod admin;
 mod client;
+pub mod connection_error;
 pub mod consumer_groups;
 mod fetch;
 mod metadata;
@@ -16,6 +17,7 @@ pub use admin::{
     ConfigEntry, ConfigOp, ConfigResourceType, CreateTopicResult, TopicToCreate,
 };
 pub use client::{KafkaClient, RESPONSE_TIMEOUT_SECS, WRITE_TIMEOUT_SECS};
+pub use connection_error::{is_connection_error, is_connection_io_kind};
 pub use consumer_groups::{
     commit_offsets, describe_groups, fetch_offsets, find_group_coordinator, list_groups,
     offsets_for_times, CommittedOffset, ConsumerGroup, ConsumerGroupDescription,
@@ -34,9 +36,8 @@ pub use sasl::{
 #[cfg(feature = "gssapi")]
 pub use sasl::{GssapiPlugin, GssapiPluginError, GssapiPluginFactory};
 
-/// Public test helper: returns true if `error` is a connection-level error that
-/// the client classifies as retriable (broken pipe, timeout, etc.).
-/// Exposed for integration tests that verify the timeout classification path.
+/// Backwards-compatible alias for [`is_connection_error`], kept for callers
+/// and tests written against the earlier name.
 pub fn is_connection_error_public(error: &crate::Error) -> bool {
-    KafkaClient::is_connection_error_pub(error)
+    is_connection_error(error)
 }

@@ -31,6 +31,7 @@ use crate::config::{KafkaConfig, SaslMechanism, SecurityProtocol};
 use crate::error::KafkaError;
 use crate::Result;
 
+use super::connection_error::{connection_io_error, request_timeout_error};
 use super::metadata::{BrokerMetadata, TopicMetadata};
 use super::FetchResponse;
 use super::ProduceResponse;
@@ -457,9 +458,10 @@ impl KafkaClient {
 
     /// Send a request and receive a response.
     ///
-    /// On connection errors (broken pipe, early eof), automatically reconnects
+    /// On connection errors (connection reset/aborted, broken pipe, EOF,
+    /// timeouts — see [`super::connection_error`]), automatically reconnects
     /// and retries once. This handles TCP connections dropped by cloud Kafka
-    /// providers during idle periods.
+    /// providers during idle periods and by Windows Winsock (issue #146).
     ///
     /// Note: Reconnection with retry is skipped for SASL auth requests to avoid
     /// infinite recursion (connect -> authenticate -> send_request -> reconnect -> connect...).
@@ -496,23 +498,12 @@ impl KafkaClient {
     }
 
     /// Check if an error is a connection-level error that warrants reconnection.
+    ///
+    /// Delegates to [`super::connection_error::is_connection_error`], which
+    /// classifies by `io::ErrorKind` / OS error code rather than message text
+    /// (issue #146).
     fn is_connection_error(error: &crate::Error) -> bool {
-        match error {
-            crate::Error::Kafka(KafkaError::Protocol(msg)) => {
-                let msg_lower = msg.to_lowercase();
-                msg_lower.contains("broken pipe")
-                    || msg_lower.contains("early eof")
-                    || msg_lower.contains("connection reset")
-                    || msg_lower.contains("not connected")
-                    || msg_lower.contains("connection abort")
-                    || msg_lower.contains("aborted")          // catches "was aborted by the software"
-                    || msg_lower.contains("timed out after")
-                    || msg_lower.contains("os error 10053")   // WSAECONNABORTED (Windows)
-                    || msg_lower.contains("os error 10054")   // WSAECONNRESET (Windows)
-                    || msg_lower.contains("os error 10060")   // WSAETIMEDOUT (Windows)
-            }
-            _ => false,
-        }
+        super::connection_error::is_connection_error(error)
     }
 
     /// Reconnect to the Kafka cluster, dropping the existing connection.
@@ -583,9 +574,12 @@ impl KafkaClient {
     {
         let api_version = self.get_api_version(api_key);
         let mut conn = self.connection.lock().await;
-        let conn = conn
-            .as_mut()
-            .ok_or_else(|| KafkaError::Protocol("Not connected".to_string()))?;
+        let conn = conn.as_mut().ok_or_else(|| KafkaError::ConnectionIo {
+            operation: "send request".to_string(),
+            kind: std::io::ErrorKind::NotConnected,
+            raw_os_error: None,
+            message: "Not connected".to_string(),
+        })?;
 
         send_rpc_on_stream(&mut conn.stream, api_key, api_version, buf).await
     }
@@ -737,18 +731,23 @@ pub(super) async fn send_rpc_on_stream<Resp>(
 where
     Resp: Decodable + Default,
 {
+    // I/O failures keep their `io::ErrorKind` / OS code (issue #146) so the
+    // reconnect path can classify them without parsing localized OS text.
     timeout(
         Duration::from_secs(WRITE_TIMEOUT_SECS),
         stream.write_all(buf),
     )
     .await
     .map_err(|_| {
-        KafkaError::Protocol(format!(
-            "Request timed out after {}s sending to broker",
-            WRITE_TIMEOUT_SECS
-        ))
+        request_timeout_error(
+            "send request",
+            format!(
+                "Request timed out after {}s sending to broker",
+                WRITE_TIMEOUT_SECS
+            ),
+        )
     })?
-    .map_err(|e| KafkaError::Protocol(format!("Failed to send request: {}", e)))?;
+    .map_err(|e| connection_io_error("send request", &e))?;
 
     let mut len_buf = [0u8; 4];
     timeout(
@@ -757,12 +756,15 @@ where
     )
     .await
     .map_err(|_| {
-        KafkaError::Protocol(format!(
-            "Request timed out after {}s waiting for broker response",
-            RESPONSE_TIMEOUT_SECS
-        ))
+        request_timeout_error(
+            "read response length",
+            format!(
+                "Request timed out after {}s waiting for broker response",
+                RESPONSE_TIMEOUT_SECS
+            ),
+        )
     })?
-    .map_err(|e| KafkaError::Protocol(format!("Failed to read response length: {}", e)))?;
+    .map_err(|e| connection_io_error("read response length", &e))?;
     let response_len = i32::from_be_bytes(len_buf) as usize;
 
     trace!("Receiving response: len={}", response_len);
@@ -774,12 +776,15 @@ where
     )
     .await
     .map_err(|_| {
-        KafkaError::Protocol(format!(
-            "Response body read timed out after {}s",
-            RESPONSE_TIMEOUT_SECS
-        ))
+        request_timeout_error(
+            "read response body",
+            format!(
+                "Response body read timed out after {}s",
+                RESPONSE_TIMEOUT_SECS
+            ),
+        )
     })?
-    .map_err(|e| KafkaError::Protocol(format!("Failed to read response body: {}", e)))?;
+    .map_err(|e| connection_io_error("read response body", &e))?;
 
     let mut response_bytes = Bytes::from(response_buf);
     let response_header_version = api_key.response_header_version(api_version);
