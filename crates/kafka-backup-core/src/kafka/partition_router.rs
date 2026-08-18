@@ -321,8 +321,18 @@ impl PartitionLeaderRouter {
 
     /// Fetch records from a partition, routing to the correct leader.
     ///
-    /// This method handles NOT_LEADER_FOR_PARTITION errors by refreshing
-    /// metadata and retrying once.
+    /// Handles the same two failure classes as [`Self::produce`]:
+    ///
+    /// 1. `NOT_LEADER_FOR_PARTITION` (error code 6): refreshes the partition-leader
+    ///    cache and retries once.
+    ///
+    /// 2. Connection errors (see [`super::connection_error`]): retries up to
+    ///    `MAX_CONNECTION_RETRIES` times with linear back-off, dropping the cached
+    ///    broker connections in between. `KafkaClient::send_request` already
+    ///    reconnects and retries once *immediately*; this loop covers blips that
+    ///    outlast that single retry — a proxy or broker resetting connections
+    ///    for a second or two would otherwise fail the partition, and with it
+    ///    the whole backup, hours in (issue #146).
     pub async fn fetch(
         &self,
         topic: &str,
@@ -330,28 +340,42 @@ impl PartitionLeaderRouter {
         offset: i64,
         max_bytes: i32,
     ) -> Result<FetchResponse> {
-        // First attempt
-        match self
-            .fetch_internal(topic, partition, offset, max_bytes)
-            .await
-        {
-            Ok(response) => Ok(response),
-            Err(e) if is_not_leader_error(&e) => {
-                // Refresh metadata and retry
-                warn!(
-                    "NOT_LEADER_FOR_PARTITION error for {}/{}, refreshing metadata",
-                    topic, partition
-                );
-                self.refresh_partition_leader(topic, partition).await?;
+        const MAX_CONNECTION_RETRIES: u32 = 5;
 
-                // Clear cached connection for old leader
-                self.clear_connection_cache().await;
+        let mut connection_attempts = 0;
 
-                // Retry with new leader
-                self.fetch_internal(topic, partition, offset, max_bytes)
-                    .await
+        loop {
+            match self
+                .fetch_internal(topic, partition, offset, max_bytes)
+                .await
+            {
+                Ok(response) => return Ok(response),
+                Err(e) if is_not_leader_error(&e) => {
+                    // Refresh metadata and retry once with the new leader
+                    warn!(
+                        "NOT_LEADER_FOR_PARTITION error for {}/{}, refreshing metadata",
+                        topic, partition
+                    );
+                    self.refresh_partition_leader(topic, partition).await?;
+                    self.clear_connection_cache().await;
+                    return self
+                        .fetch_internal(topic, partition, offset, max_bytes)
+                        .await;
+                }
+                Err(e)
+                    if is_connection_error(&e) && connection_attempts < MAX_CONNECTION_RETRIES =>
+                {
+                    connection_attempts += 1;
+                    let backoff = Duration::from_millis(500 * connection_attempts as u64);
+                    warn!(
+                        "Connection error fetching {}/{} (attempt {}/{}), retrying after {:?}: {}",
+                        topic, partition, connection_attempts, MAX_CONNECTION_RETRIES, backoff, e
+                    );
+                    self.clear_connection_cache().await;
+                    tokio::time::sleep(backoff).await;
+                }
+                Err(e) => return Err(e),
             }
-            Err(e) => Err(e),
         }
     }
 
@@ -898,18 +922,11 @@ fn group_partition_offsets_by_leader(
 }
 
 /// Check if an error is a connection-level error that warrants a retry.
+///
+/// Shares the classifier with `KafkaClient::send_request` (issue #146) so the
+/// produce / delete-records retry loops recognise the same set of failures.
 fn is_connection_error(error: &crate::Error) -> bool {
-    match error {
-        crate::Error::Kafka(KafkaError::Protocol(msg)) => {
-            msg.contains("Broken pipe")
-                || msg.contains("early eof")
-                || msg.contains("Connection reset")
-                || msg.contains("Not connected")
-                || msg.contains("connection abort")
-                || msg.contains("timed out after")
-        }
-        _ => false,
-    }
+    super::connection_error::is_connection_error(error)
 }
 
 /// Check if an error is a NOT_LEADER_FOR_PARTITION error (code 6).

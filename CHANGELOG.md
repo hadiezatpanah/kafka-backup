@@ -5,6 +5,51 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.17.1] - 2026-08-18
+
+### Fixed
+- Connection-loss detection no longer depends on the wording of the OS error
+  message. `KafkaClient::send_request` (reconnect + retry once) and the
+  partition router's produce / delete-records retry loops classified a failed
+  socket read or write by substring-matching `io::Error`'s Display text, which
+  is localized and platform-specific: Windows' `WSAECONNABORTED`
+  ("An established connection was aborted by the software in your host
+  machine. (os error 10053)"), `WSAECONNRESET` (10054) and `WSAETIMEDOUT`
+  (10060) never matched — nor did Unix `ETIMEDOUT` ("Operation timed out" /
+  "Connection timed out") or `ENOTCONN` — so a dropped connection failed the
+  whole backup or restore, sometimes hours in. I/O failures on the broker
+  connection are now surfaced as `KafkaError::ConnectionIo`, which preserves
+  the `std::io::ErrorKind` and raw OS error code, and a single shared
+  classifier (`kafka::is_connection_error`) decides by kind / code —
+  `ConnectionAborted`, `ConnectionReset`, `ConnectionRefused`, `BrokenPipe`,
+  `NotConnected`, `TimedOut`, `UnexpectedEof`, `NetworkDown`,
+  `NetworkUnreachable`, `HostUnreachable`, plus the Winsock codes `std` leaves
+  uncategorized (`WSAENETRESET`, `WSAESHUTDOWN`) and, on Windows,
+  `ERROR_NETNAME_DELETED` / `ERROR_SEM_TIMEOUT`. A message-based fallback is
+  kept for errors still built as `KafkaError::Protocol(String)`. Fixes
+  [#146](https://github.com/osodevops/kafka-backup/issues/146).
+- Connection I/O errors are now attributed as `broker_connection` in
+  `kafka_backup_errors_total` instead of `unknown`.
+- `PartitionLeaderRouter::fetch` (the backup path) now retries connection
+  errors up to 5 times with linear back-off, dropping cached broker
+  connections in between — the same policy `produce` and `delete_records`
+  already had. `KafkaClient::send_request` still reconnects and retries once
+  immediately; the router loop covers a proxy or broker resetting connections
+  for longer than that single retry, which previously failed the partition and
+  the whole run.
+
+### Added
+- `KafkaError::ConnectionIo { operation, kind, raw_os_error, message }`
+  (`KafkaError` is `#[non_exhaustive]`, so this is additive) and the public
+  `kafka::is_connection_error` / `kafka::is_connection_io_kind` helpers.
+  `kafka::is_connection_error_public` remains as an alias.
+
+### Changed
+- Socket I/O failures on a broker connection now render as
+  `Connection error during <operation> (<ErrorKind>): <os message>` instead of
+  `Protocol error: Failed to <operation>: <os message>`. Update any log-based
+  alerting that matched the old prefix.
+
 ## [0.17.0] - 2026-08-18
 
 ### Fixed

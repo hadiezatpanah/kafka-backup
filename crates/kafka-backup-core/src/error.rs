@@ -81,6 +81,26 @@ pub enum KafkaError {
     #[error("Broker returned error code {code}: {message}")]
     BrokerError { code: i16, message: String },
 
+    /// I/O failure on an established broker connection: sending a request,
+    /// reading a response, or one of our own request timeouts.
+    ///
+    /// Carries the [`std::io::ErrorKind`] and raw OS error code so callers can
+    /// decide whether the connection is lost without parsing the OS message —
+    /// which is localized (`FormatMessageW` on Windows, `strerror_r` on Unix)
+    /// and differs per platform (issue #146). Use
+    /// [`crate::kafka::is_connection_error`] rather than matching on `message`.
+    #[error("Connection error during {operation} ({kind:?}): {message}")]
+    ConnectionIo {
+        /// What the client was doing, e.g. `"send request"`.
+        operation: String,
+        /// `io::Error::kind()`; `TimedOut` for the client's own request timeouts.
+        kind: std::io::ErrorKind,
+        /// `io::Error::raw_os_error()` when the OS supplied one (errno / Winsock code).
+        raw_os_error: Option<i32>,
+        /// The OS or library message, for logs and operators.
+        message: String,
+    },
+
     /// Timeout
     #[error("Operation timed out: {0}")]
     Timeout(String),
